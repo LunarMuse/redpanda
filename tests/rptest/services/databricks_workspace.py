@@ -62,13 +62,18 @@ class DatabricksWorkspace(Service):
 
         self._location_names.add(bucket)
 
-        location: ExternalLocationInfo = self._client.external_locations.create(
-            name=bucket,
-            # TODO: Add support for gcs, azure
-            url=f"s3://{bucket}",
-            credential_name=self._databricks_context.ext_loc_credential_name,
-        )
-        self.logger.debug(f"Created external location: {location}")
+        try:
+            location: ExternalLocationInfo = self._client.external_locations.create(
+                name=bucket,
+                # TODO: Add support for gcs, azure
+                url=f"s3://{bucket}",
+                credential_name=self._databricks_context.
+                ext_loc_credential_name,
+            )
+            self.logger.debug(f"Created external location: {location}")
+        except databricks.sdk.errors.DatabricksError as e:
+            self.logger.error(f"Failed to create external location: {str(e)}")
+            raise
 
         requested_catalog_name = f"panda-catalog-{uuid.uuid1()}"
         self._catalog_names.add(requested_catalog_name)

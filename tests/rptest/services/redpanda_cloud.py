@@ -153,6 +153,7 @@ class LiveClusterParams:
     name: str | None = None
     last_status: str = ""
     consoleUrl: str = ""
+    dataplane_public_api_url: str = ""
     network_id: str | None = None
     network_cidr: str | None = None
     install_pack_ver: str | None = None
@@ -1548,6 +1549,7 @@ class CloudCluster():
                                        endpoint='/ScaleCluster',
                                        json=payload)
 
+    # Update cluster properties using Admin API
     def set_cluster_config_overrides(self, cluster_id, config_values):
         """
         Set configuration overrides for a specific Redpanda cloud cluster using Admin API
@@ -1562,3 +1564,49 @@ class CloudCluster():
         return self.cloudv2._http_post(base_url=self.config.admin_api_url,
                                        endpoint='/SetClusterConfigOverrides',
                                        json=payload)
+
+    # Update cluster properties using Public API
+    def update_cluster_property_public(self, cluster_id, property_key,
+                                       property_value):
+        """
+        Update a specific cluster property via the public API.
+        :param property_key: The property key to update
+        :param property_value: The value to set for the property
+        :return: response from the API request
+        """
+        # Prepare the payload dynamically based on the key and value
+        update_resp = self.public_api._http_patch(
+            base_url=self.config.public_api_url,
+            endpoint=f"/v1/clusters/{cluster_id}",
+            json={
+                "cluster_configuration": {
+                    "custom_properties": {
+                        property_key: property_value
+                    }
+                }
+            })
+        return update_resp
+
+    def create_secret(self,
+                      secret_id,
+                      secret_data,
+                      dataplane_url,
+                      scopes=None):
+        """
+        Create a new secret on dataplane and return the response.
+        :param secret_id: ID of the secret to create
+        :param secret_data: Data for the secret
+        :param dataplane_url: Dataplane API URL to create the secret
+        :param scopes: List of scopes for the secret (default is ["SCOPE_REDPANDA_CLUSTER"])
+        :return: response from the API request
+        """
+        if scopes is None:
+            scopes = ["SCOPE_REDPANDA_CLUSTER"]
+        response = self.public_api._http_post(base_url=dataplane_url,
+                                              endpoint=f"/v1/secrets",
+                                              json={
+                                                  "id": secret_id,
+                                                  "scopes": scopes,
+                                                  "secret_data": secret_data,
+                                              })
+        return response

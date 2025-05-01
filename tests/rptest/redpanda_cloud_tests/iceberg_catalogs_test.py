@@ -16,7 +16,7 @@ import requests
 from ducktape.mark import matrix
 from rptest.tests.redpanda_cloud_test import RedpandaCloudTest
 from rptest.services.provider_clients.rpcloud_client import RpCloudApiClient
-from rptest.clients.databricks_client import DatabricksClient
+#from rptest.clients.databricks_client import DatabricksClient
 
 from rptest.clients.installpack import InstallPackClient
 from rptest.clients.rpk import RpkTool, TopicSpec, RpkException
@@ -24,6 +24,15 @@ from rptest.clients.rpk import RpkTool, TopicSpec, RpkException
 from rptest.services.redpanda import get_cloud_provider
 from rptest.services.cluster import cluster
 from rptest.services.redpanda import RedpandaServiceCloud
+
+from rptest.services.databricks_workspace import DatabricksWorkspace
+from rptest.context.databricks import DatabricksContext as DatabricksContext
+from rptest.services.catalog_service import CatalogType
+#from rptest.tests.datalake.datalake_services import DatalakeServices
+#from rptest.tests.datalake.query_engine_base import QueryEngineType
+#from rptest.tests.datalake.utils import supported_storage_types
+#from rptest.tests.redpanda_test import RedpandaTest
+#from rptest.utils.mode_checks import cleanup_on_early_exit
 
 
 def supported_catalog_types():
@@ -62,174 +71,68 @@ class IcebergCloudCatalogsTest(RedpandaCloudTest):
         assert self.redpanda.cluster_healthy()
         self.redpanda.assert_cluster_is_reusable()
 
-    @cluster(num_nodes=3)
-    def test_iceberg_unity_catalog(self):
+    @cluster(num_nodes=1)
+    def test_databricks_basic(self):
         # Get globals.json map
         globals = self._ctx.globals
 
         cloud_cluster = self.redpanda._cloud_cluster
         client: RpCloudApiClient = cloud_cluster.public_api
 
-        # Log catalog params, except secret/token
-        for k in (
-                "iceberg_rest_catalog_endpoint",
-                "iceberg_rest_catalog_authentication_mode",
-                "iceberg_rest_catalog_client_id",
-                "iceberg_rest_catalog_warehouse",
-        ):
-            self.logger.debug(f"{k}: {globals.get(k)}")
+        databricks_client = DatabricksWorkspace(context=self._ctx)
+        bucket = f"redpanda-cloud-storage-{self._clusterId}"
+        catalog_info = databricks_client.create_catalog(bucket=bucket)
 
-        cloud_cluster = self.redpanda._cloud_cluster
-        client: RpCloudApiClient = cloud_cluster.public_api
-
-        # Enable Iceberg feature via public API
-        enable_resp = client._http_patch(
-            base_url=cloud_cluster.config.public_api_url,
-            endpoint=f"/v1/clusters/{cloud_cluster.current.cluster_id}",
-            json={
-                "cluster_configuration": {
-                    "custom_properties": {
-                        "iceberg_enabled": True
-                    }
-                }
-            })
+        enable_resp = cloud_cluster.update_cluster_property_public(
+            self._clusterId, "iceberg_enabled", True)
         self.logger.debug(f"Enable iceberg response: {enable_resp}")
 
-        secret = globals["iceberg_rest_catalog_client_secret"]
+        # Parameters for creating redpanda secret
+        secret_id = "TEST5"
+        secret_data = globals["databricks_client_secret"]
+        dataplane_url = "https://api-bcc8909f.d095sv34bhjo2t0rfqh0.byoc.ign.cloud.redpanda.com"  # TODO: Get URL from spec
 
-        # Create new secret on dataplane and then pass it to Redpanda iceberg config
-        try:
-            response = client._http_post(
-                # base_url=cloud_cluster.config.dataplane_api_url,
-                # TODO Marat: Fetch correct dataplane URL
-                base_url=
-                "https://api-fa3bbf12.d057avt4knf5ipm986eg.byoc.ign.cloud.redpanda.com",
-                endpoint=f"/v1/secrets",
-                json={
-                    "id": "TEST",
-                    "scopes": ["SCOPE_REDPANDA_CLUSTER"],
-                    "secret_data": secret,
-                })
-            self.logger.debug(
-                f"Response for creating new secret via public API: {response}")
-        except requests.exceptions.HTTPError as e:
-            # log full response body to see the validation error
-            self.logger.error(
-                f"Failed to create secret, status={e.response.status_code}, body={e.response.text}"
-            )
-            raise
+        # Call create_secret with default scopes
+        create_resp = cloud_cluster.create_secret(secret_id, secret_data,
+                                                  dataplane_url)
+        self.logger.debug(f"Create secret response: {create_resp}")
 
-        # Pass catalog params
+        self.logger.debug(f"===============\n\n\n")
+
+        # Construct the payload for the request
+        payload = {
+            "cluster_configuration": {
+                "custom_properties": {
+                    "iceberg_rest_catalog_endpoint":
+                    globals["databricks_workspace_url"],
+                    "iceberg_rest_catalog_authentication_mode":
+                    "oauth2",
+                    "iceberg_rest_catalog_client_id":
+                    globals["databricks_client_id"],
+                    "iceberg_rest_catalog_client_secret":
+                    f"${{secrets.{secret_id}}}",
+                    "iceberg_rest_catalog_warehouse":
+                    globals["databricks_sql_warehouse_path"],
+                    "iceberg_catalog_type":
+                    "rest"
+                }
+            }
+        }
+
+        # Log the constructed payload for debugging
+        self.logger.debug(f"Payload to be sent: {payload}")
+
+        # Send the HTTP PATCH request
         response = client._http_patch(
             base_url=cloud_cluster.config.public_api_url,
             endpoint=f"/v1/clusters/{cloud_cluster.current.cluster_id}",
-            json={
-                "cluster_configuration": {
-                    "custom_properties": {
-                        "iceberg_rest_catalog_endpoint":
-                        globals["iceberg_rest_catalog_endpoint"],
-                        "iceberg_rest_catalog_authentication_mode":
-                        globals["iceberg_rest_catalog_authentication_mode"],
-                        "iceberg_rest_catalog_client_id":
-                        globals["iceberg_rest_catalog_client_id"],
-                        "iceberg_rest_catalog_client_secret":
-                        "${secrets.TEST}",
-                        "iceberg_rest_catalog_warehouse":
-                        globals["iceberg_rest_catalog_warehouse"],
-                        "iceberg_catalog_type":
-                        "rest",
-                    }
-                }
-            })
+            json=payload)
+
+        # Log the response for debugging
         self.logger.debug(
             f"Response for passing catalog params via public API: {response}")
 
-        ## Databricks specific section
-        host = "dbc-0f5177e3-6aa4.cloud.databricks.com"
-        token = globals["databricks_token"]
-        sql_http_path = "/sql/1.0/warehouses/762a1e2735b5e17d"
-        principal = "47ef0607-df2b-482f-9cbc-ba02d8c776a1"
+        # TODO Marat insert topics and verification
 
-        db = DatabricksClient(host=host,
-                              token=token,
-                              sql_http_path=sql_http_path)
-
-        # Build object storage path
-        storage_uri_prefix = "s3"
-        bucket = f"redpanda-cloud-storage-{self._clusterId}"
-        warehouse = globals["iceberg_rest_catalog_warehouse"]
-        s3_path = f"{storage_uri_prefix}://{bucket}/{warehouse}".rstrip("/")
-
-        # Not needed as have credentials for all accounts
-        '''
-        # Create the storage credential
-        cred_name = f"testing-cloud-devprod-{bucket}"
-        iam_role_arn="arn:aws:iam::471112860801:role/DatabricksUnityCatalogRole"
-        try:
-            cred = db.create_storage_credential(
-                iam_role_arn=iam_role_arn,
-                name=cred_name,
-                comment="Created with Ducktape tests"
-            )
-            self.logger.info(f"Storage credential created: {cred.name!r}")
-        except Exception as e:
-            self.logger.exception("Failed to create storage credential")
-        '''
-
-        # The name of the pre-existing storage credential in Unity Catalog
-        # TODO Marat: map which account is being used during tests and select credentials
-        cred_name = "testing-cloud-devprod-471112860801"
-
-        # Create an External Location pointing at storage path
-        loc_name = f"testing-cloud-devprod-extloc-{bucket}"
-        external_location = db.create_external_location(
-            name=loc_name,
-            credential_name=cred_name,
-            url=s3_path,
-            comment="Iceberg external location for Redpanda tests")
-        self.logger.info(
-            f"External location created: {external_location.name}")
-
-        # Create Unity Catalog
-        catalog_name = f"testing-cloud-devprod-{self._clusterId}"
-        catalog = db.create_catalog(
-            name=catalog_name,
-            storage_root=external_location.url,
-            comment="Iceberg Unity Catalog for Redpanda tests")
-        self.logger.info(
-            f"Unity Catalog created (or fetched existing): {catalog.name}")
-
-        db.grant_all_privileges_on_catalog(catalog_name, principal)
-
-        # create a schema and grant external use
-        db.create_schema_and_grant(catalog_name, "redpanda", principal)
-
-        # Create iceberg enabled topics
-        self.rpk = RpkTool(self.redpanda)
-
-        test_topic = 'test_topic'
-        self.rpk.create_topic(test_topic)
-        self.rpk.alter_topic_config(test_topic,
-                                    TopicSpec.PROPERTY_ICEBERG_MODE,
-                                    'key_value')
-
-        MESSAGE_COUNT = 20
-        for i in range(MESSAGE_COUNT):
-            self.rpk.produce(test_topic, f"foo {i} ", f"bar {i}")
-
-        self.logger.debug("Waiting 1 minute...")
-        time.sleep(60)
-
-        # TODO Marat: verify data and metadata files on object storage
-        # TODO Marat: query data using rest APIs
-        # TODO Marat: verify that tables on databricks catalog match redpanda topics data
-        # TODO Marat: Clean up
-
-
-#    @cluster(num_nodes=3)
-#    @matrix(
-#    catalog_type=supported_catalog_types(),
-#    network_type=supported_network_types()
-#    )
-#    def test_iceberg_unity_catalog(self):
-#TODO Marat: performance and OMB tests
+        # databricks cleanup
+        databricks_client.stop()
