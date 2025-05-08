@@ -9,6 +9,8 @@
 
 #include "storage/segment_deduplication_utils.h"
 
+#include "model/fundamental.h"
+#include "model/timeout_clock.h"
 #include "model/timestamp.h"
 #include "storage/compacted_index_writer.h"
 #include "storage/compaction_reducers.h"
@@ -22,9 +24,13 @@
 #include "storage/segment_utils.h"
 #include "storage/types.h"
 
+#include <seastar/core/loop.hh>
+#include <seastar/core/seastar.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/coroutine/as_future.hh>
 
 #include <exception>
+#include <optional>
 
 namespace storage {
 
@@ -42,7 +48,7 @@ ss::future<ss::stop_iteration> put_entry(
     co_return ss::stop_iteration::yes;
 }
 
-ss::future<bool> should_keep(
+ss::future<bool> is_latest_record_for_key(
   const key_offset_map& map,
   const model::record_batch& b,
   const model::record& r) {
@@ -184,56 +190,50 @@ ss::future<index_state> deduplicate_segment(
     }
     auto rdr = internal::create_segment_full_reader(
       seg, cfg, probe, std::move(read_holder));
+
+    auto segment_last_offset = seg->offsets().get_committed_offset();
     auto compaction_placeholder_enabled = feature_table.local().is_active(
       features::feature::compaction_placeholder_batch);
-
     const bool past_tombstone_delete_horizon
       = internal::is_past_tombstone_delete_horizon(seg, cfg);
     bool may_have_tombstone_records = false;
+
+    auto is_latest_record = [&map](
+                              const model::record_batch& b,
+                              const model::record& r) -> ss::future<bool> {
+        return is_latest_record_for_key(map, b, r);
+    };
+
+    auto record_filter = [f = std::move(is_latest_record),
+                          &feature_table,
+                          segment_last_offset,
+                          past_tombstone_delete_horizon,
+                          &may_have_tombstone_records,
+                          &probe](
+                           const model::record_batch& b,
+                           const model::record& r,
+                           bool is_last_record_in_batch) {
+        return internal::should_keep(
+          b,
+          r,
+          is_last_record_in_batch,
+          f,
+          probe,
+          feature_table,
+          segment_last_offset,
+          past_tombstone_delete_horizon,
+          may_have_tombstone_records);
+    };
+
     auto copy_reducer = internal::copy_data_segment_reducer(
-      [&map,
-       &may_have_tombstone_records,
-       &probe,
-       segment_last_offset = seg->offsets().get_committed_offset(),
-       past_tombstone_delete_horizon,
-       compaction_placeholder_enabled](
-        const model::record_batch& b,
-        const model::record& r,
-        bool is_last_record_in_batch) {
-          auto is_last_batch = b.last_offset() == segment_last_offset;
-          // once compaction placeholder feature is enabled, we are not
-          // worried about empty batches as the reducer then installs a
-          // placeholder batch if all the records are compacted away.
-          if (
-            !compaction_placeholder_enabled
-            && (is_last_batch && is_last_record_in_batch)) {
-              vlog(
-                gclog.trace,
-                "retaining last record: {} of segment from batch: {}",
-                r,
-                b.header());
-              return ss::make_ready_future<bool>(true);
-          }
-
-          // Deal with tombstone record removal
-          if (r.is_tombstone() && past_tombstone_delete_horizon) {
-              probe.add_removed_tombstone();
-              return ss::make_ready_future<bool>(false);
-          }
-
-          return should_keep(map, b, r).then(
-            [&may_have_tombstone_records,
-             is_tombstone = r.is_tombstone()](bool keep) {
-                if (is_tombstone && keep) {
-                    may_have_tombstone_records = true;
-                }
-                return keep;
-            });
-      },
+      seg->path().get_ntp(),
+      std::move(record_filter),
       &appender,
       seg->path().is_internal_topic(),
       should_offset_delta_times,
-      seg->offsets().get_committed_offset(),
+      seg->index().base_offset(),
+      segment_last_offset,
+      compaction_placeholder_enabled,
       &cmp_idx_writer,
       inject_reader_failure,
       cfg.asrc);
@@ -278,12 +278,16 @@ ss::future<bool> index_chunk_of_segment_for_map(
   key_offset_map& map,
   probe& pb,
   model::offset& last_indexed_offset) {
+    if (seg->is_closed()) {
+        throw segment_closed_exception();
+    }
     co_await map.reset();
     auto read_holder = co_await seg->read_lock();
     auto start_offset_inclusive = model::next_offset(last_indexed_offset);
     auto rdr = internal::create_segment_full_reader(
       seg, compact_cfg, pb, std::move(read_holder), start_offset_inclusive);
-    internal::map_building_reducer reducer(&map, start_offset_inclusive);
+    internal::map_building_reducer reducer(
+      seg->path().get_ntp(), &map, start_offset_inclusive);
 
     bool fully_indexed_segment = co_await std::move(rdr).consume(
       reducer, model::no_timeout);
@@ -304,6 +308,52 @@ ss::future<bool> index_chunk_of_segment_for_map(
     }
 
     co_return fully_indexed_segment;
+}
+
+ss::future<bool> segment_needs_rewrite_with_offset_map(
+  const compaction_config& cfg,
+  ss::lw_shared_ptr<segment> seg,
+  const key_offset_map& map) {
+    auto compaction_idx_path = seg->path().to_compacted_index();
+    // If the file doesn't exist for whatever reason, return true.
+    // This could, for example, race with a truncation which removes the
+    // .compaction_index.
+    if (!co_await ss::file_exists(compaction_idx_path.string())) {
+        co_return true;
+    }
+    auto compaction_idx_file = co_await internal::make_reader_handle(
+      compaction_idx_path, cfg.sanitizer_config);
+    auto rdr = make_file_backed_compacted_reader(
+      compaction_idx_path, compaction_idx_file, cfg.iopc, 64_KiB, cfg.asrc);
+
+    auto fut = co_await ss::coroutine::as_future(rdr.verify_integrity());
+    if (fut.failed()) {
+        // If we were unable to read the .compaction_index file, proceed with
+        // compaction.
+        fut.ignore_ready_future();
+        co_await rdr.close();
+        co_return true;
+    }
+
+    bool segment_needs_rewrite = false;
+    // The segment in question needs rewriting _only_ iff it contains at least
+    // one key found in the key_offset_map which is not the latest offset for
+    // that key.
+    co_await rdr.for_each_async(
+      [&map, &segment_needs_rewrite](
+        const compacted_index::entry& e) -> ss::future<ss::stop_iteration> {
+          model::offset o = e.offset + model::offset_delta(e.delta);
+          return map.get(e.key).then([o, &segment_needs_rewrite](
+                                       std::optional<model::offset> map_entry) {
+              if (map_entry.has_value() && map_entry.value() > o) {
+                  segment_needs_rewrite = true;
+                  return ss::stop_iteration::yes;
+              }
+              return ss::stop_iteration::no;
+          });
+      },
+      model::no_timeout);
+    co_return segment_needs_rewrite;
 }
 
 } // namespace storage

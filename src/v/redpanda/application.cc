@@ -115,6 +115,7 @@
 #include "metrics/prometheus_sanitize.h"
 #include "migrations/migrators.h"
 #include "migrations/rbac_migrator.h"
+#include "migrations/topic_id_migrator.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "net/dns.h"
@@ -454,7 +455,7 @@ int application::run(int ac, char** av) {
       "node-id-overrides",
       po::value<std::vector<config::node_id_override>>()->multitoken(),
       "Override node UUID and ID iff current UUID matches "
-      "- usage: <current UUID>:<new UUID>:<new ID>");
+      "- usage: <current UUID>:<new UUID>:<new ID>[/ignore_existing_node_id]?");
 
     // Validate command line args using options registered by the app and
     // seastar. Keep the resulting variables in a temporary map so they don't
@@ -2726,15 +2727,19 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
     cluster::cluster_discovery cd(
       node_uuid, storage.local(), app_signal.abort_source());
 
-    bool ever_ran_controller = storage.local()
-                                 .kvs()
-                                 .get(
-                                   storage::kvstore::key_space::controller,
-                                   cluster::controller::invariants_key())
-                                 .has_value();
+    auto invariants_buf = storage.local().kvs().get(
+      storage::kvstore::key_space::controller,
+      cluster::controller::invariants_key());
+
+    bool ever_ran_controller = invariants_buf.has_value();
+
+    bool has_id = config::node().node_id().has_value() && ever_ran_controller;
+
+    bool force_override = _node_overrides.node_id().has_value()
+                          && _node_overrides.ignore_existing_node_id();
 
     model::node_id node_id;
-    if (config::node().node_id().has_value() && ever_ran_controller) {
+    if (has_id && !force_override) {
         vlog(
           _log.info,
           "Running with already-established node ID {}",
@@ -2743,15 +2748,31 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
     } else if (auto id = _node_overrides.node_id(); id.has_value()) {
         vlog(
           _log.warn,
-          "Overriding node ID: {} -> {}",
+          "Overriding node ID: {} -> {} [ignore_existing_node_id? {}]",
           config::node().node_id(),
-          id);
+          id,
+          has_id && force_override);
         node_id = id.value();
         // null out the config'ed ID indiscriminately; it will be set outside
         // the conditional
         ss::smp::invoke_on_all([] {
             config::node().node_id.set_value(std::nullopt);
         }).get();
+        if (invariants_buf.has_value()) {
+            auto invariants
+              = reflection::from_iobuf<cluster::configuration_invariants>(
+                std::move(invariants_buf.value()));
+            invariants.node_id = node_id;
+            storage.local()
+              .kvs()
+              .put(
+                storage::kvstore::key_space::controller,
+                cluster::controller::invariants_key(),
+                reflection::to_iobuf(
+                  cluster::configuration_invariants{invariants}))
+              .get();
+            vlog(_log.debug, "Force-updated local node_id to {}", node_id);
+        }
     } else {
         auto registration_result = cd.register_with_cluster().get();
         node_id = registration_result.assigned_node_id;
@@ -2841,6 +2862,9 @@ void application::wire_up_and_start(::stop_signal& app_signal, bool test_mode) {
         _migrators.push_back(
           std::make_unique<features::migrators::shard_placement_migrator>(
             *controller));
+        _migrators.push_back(
+          std::make_unique<features::migrators::topic_id_migrator>(
+            *controller));
     }
 
     if (cd.is_cluster_founder().get()) {
@@ -2919,22 +2943,19 @@ void application::start_runtime_services(
       .invoke_on_all([this](cluster::partition_manager& pm) {
           pm.register_factory<cluster::tm_stm_factory>(feature_table);
           pm.register_factory<cluster::id_allocator_stm_factory>();
-          pm.register_factory<transform::transform_offsets_stm_factory>(
-            controller->get_topics_state());
+          pm.register_factory<transform::transform_offsets_stm_factory>();
           pm.register_factory<cluster::rm_stm_factory>(
             config::shard_local_cfg().enable_transactions.value(),
             config::shard_local_cfg().enable_idempotence.value(),
             tx_gateway_frontend,
             producer_manager,
-            feature_table,
-            controller->get_topics_state());
+            feature_table);
           pm.register_factory<cluster::log_eviction_stm_factory>(
             storage.local().kvs());
           pm.register_factory<cluster::archival_metadata_stm_factory>(
             config::shard_local_cfg().cloud_storage_enabled(),
             cloud_storage_api,
-            feature_table,
-            controller->get_topics_state());
+            feature_table);
           pm.register_factory<kafka::group_tx_tracker_stm_factory>(
             feature_table);
           pm.register_factory<cluster::partition_properties_stm_factory>(

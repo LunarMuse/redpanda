@@ -586,7 +586,7 @@ redpanda_cc_btest(
     ],
 )
 
-redpanda_cc_btest(
+redpanda_cc_gtest(
     name = "log_segment_reader_test",
     timeout = "short",
     srcs = [
@@ -602,10 +602,9 @@ redpanda_cc_btest(
         "//src/v/storage:record_batch_utils",
         "//src/v/storage:segment_appender",
         "//src/v/storage/tests:disk_log_builder",
-        "//src/v/test_utils:seastar_boost",
-        "@boost//:test",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
         "@seastar",
-        "@seastar//:testing",
     ],
 )
 
@@ -836,6 +835,10 @@ redpanda_cc_gtest(
     cpu = 1,
     deps = [
         "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/cluster:features",
+        "//src/v/container:fragmented_vector",
+        "//src/v/features",
         "//src/v/kafka/server/tests:kafka_test_utils",
         "//src/v/model",
         "//src/v/random:generators",
@@ -856,7 +859,7 @@ redpanda_cc_gtest(
 
 redpanda_cc_btest(
     name = "compaction_fuzz_test",
-    timeout = "short",
+    timeout = "moderate",
     srcs = [
         "compaction_fuzz_test.cc",
     ],

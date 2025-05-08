@@ -20,7 +20,7 @@ from rptest.services.admin import OutboundDataMigration, InboundDataMigration, N
 
 import confluent_kafka as ck
 
-from ducktape.mark import matrix
+from ducktape.mark import matrix, ignore
 from ducktape.tests.test import TestContext
 from ducktape.utils.util import wait_until
 from rptest.services.cluster import cluster

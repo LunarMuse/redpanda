@@ -3753,12 +3753,7 @@ class RedpandaService(RedpandaServiceBase):
         are actually redpanda crashes.
         """
 
-        allow_list = []
-        if log_allow_list:
-            for a in log_allow_list:
-                if should_compile(a):
-                    a = re.compile(a)
-                allow_list.append(a)
+        allow_list = prepare_allow_list(log_allow_list)
 
         def is_allowed_log_line(line: str) -> bool:
             for a in allow_list:
@@ -5522,7 +5517,7 @@ class RedpandaService(RedpandaServiceBase):
                                          new_nodes,
                                          admin=None,
                                          min_partitions=5,
-                                         progress_timeout=30,
+                                         progress_timeout=60,
                                          timeout=300,
                                          backoff=2):
         """Waits until the rebalance triggered by adding new nodes is finished."""

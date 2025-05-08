@@ -16,6 +16,7 @@
 #include "storage/compacted_index_reader.h"
 #include "storage/compacted_index_writer.h"
 #include "storage/compacted_offset_list.h"
+#include "storage/logger.h"
 #include "storage/probe.h"
 #include "storage/readers_cache.h"
 #include "storage/segment.h"
@@ -25,6 +26,7 @@
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/rwlock.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/util/noncopyable_function.hh>
 
 #include <roaring/roaring.hh>
 
@@ -223,22 +225,36 @@ struct clean_segment_value
     auto serde_fields() { return std::tie(segment_name); }
 };
 
-inline bool
-is_compactible_control_batch(const model::record_batch_type batch_type) {
+inline bool is_compactible_control_batch(
+  const model::ntp& ntp, const model::record_batch_type batch_type) {
     // Control batches in consumer offsets are special compared to
     // the ones in data partitions can be safely compacted away.
-    return batch_type == model::record_batch_type::group_fence_tx
+    //
+    // tx_fence batches  in consumer offsets are special and should be
+    // compacted. They were used historically to mark the begin of a transaction
+    // but later switched to group_fence_tx.
+
+    // Note: This ugly hack of propagating the consumer offsets flag is
+    // temporary until we fix the compaction to compact away all the control
+    // batches (including the ones in data partitions), at which point we solely
+    // can make this decision on whether the batch is a control batch or not and
+    // avoid propagating the flag everywhere.
+    return unlikely(
+             batch_type == model::record_batch_type::tx_fence
+             && model::is_consumer_offsets_topic(ntp))
+           || batch_type == model::record_batch_type::group_fence_tx
            || batch_type == model::record_batch_type::group_prepare_tx
            || batch_type == model::record_batch_type::group_abort_tx
            || batch_type == model::record_batch_type::group_commit_tx;
 }
 
-inline bool is_compactible(const model::record_batch_header& h) {
+inline bool
+is_compactible(const model::ntp& ntp, const model::record_batch_header& h) {
     if (
-      (h.attrs.is_control() && !is_compactible_control_batch(h.type))
+      (h.attrs.is_control() && !is_compactible_control_batch(ntp, h.type))
       || h.type == model::record_batch_type::compaction_placeholder) {
-        // Keep control batches to ensure we maintain transaction boundaries.
-        // They should be rare.
+        // Keep control batches to ensure we maintain transaction boundaries
+        // (unless it is CO topic). They should be rare.
         return false;
     }
     static const auto filtered_types = model::offset_translator_batch_types();
@@ -246,8 +262,9 @@ inline bool is_compactible(const model::record_batch_header& h) {
     return n == 0;
 }
 
-inline bool is_compactible(const model::record_batch& b) {
-    return is_compactible(b.header());
+inline bool
+is_compactible(const model::ntp& ntp, const model::record_batch& b) {
+    return is_compactible(ntp, b.header());
 }
 
 offset_delta_time should_apply_delta_time_offset(
@@ -298,6 +315,53 @@ auto with_segment_reader_handle(segment_reader_handle handle, Func func) {
                 [] { return ss::make_ready_future<>(); });
           });
       });
+}
+
+template<typename Func>
+ss::future<bool> should_keep(
+  const model::record_batch& b,
+  const model::record& r,
+  bool is_last_record_in_batch,
+  Func&& is_latest_key,
+  probe& pb,
+  ss::sharded<features::feature_table>& feature_table,
+  model::offset segment_last_offset,
+  bool past_tombstone_delete_horizon,
+  bool& may_have_tombstone_records) {
+    auto compaction_placeholder_enabled = feature_table.local().is_active(
+      features::feature::compaction_placeholder_batch);
+    auto is_last_batch = b.last_offset() == segment_last_offset;
+    // once compaction placeholder feature is enabled, we are not
+    // worried about empty batches as the reducer then installs a
+    // placeholder batch if all the records are compacted away.
+    if (
+      !compaction_placeholder_enabled
+      && (is_last_batch && is_last_record_in_batch)) {
+        vlog(
+          gclog.trace,
+          "retaining last record: {} of segment from batch: {}",
+          r,
+          b.header());
+        if (r.is_tombstone()) {
+            may_have_tombstone_records = true;
+        }
+
+        co_return true;
+    }
+
+    // Deal with tombstone record removal
+    if (r.is_tombstone() && past_tombstone_delete_horizon) {
+        pb.add_removed_tombstone();
+        co_return false;
+    }
+
+    auto keep = co_await is_latest_key(b, r);
+
+    if (r.is_tombstone() && keep) {
+        may_have_tombstone_records = true;
+    }
+
+    co_return keep;
 }
 
 } // namespace storage::internal

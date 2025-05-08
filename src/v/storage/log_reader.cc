@@ -18,6 +18,7 @@
 #include "storage/logger.h"
 #include "storage/offset_translator_state.h"
 #include "storage/parser_errc.h"
+#include "storage/parser_utils.h"
 #include "storage/segment_set.h"
 #include "storage/types.h"
 
@@ -57,28 +58,6 @@ model::record_batch make_ghost_batch(
     return batch;
 }
 
-/**
- * makes multiple ghost batches required to fill the gap in a way that max batch
- * size (max of int32_t) is not exceeded
- */
-std::vector<model::record_batch> make_ghost_batches(
-  model::offset start_offset, model::offset end_offset, model::term_id term) {
-    std::vector<model::record_batch> batches;
-    while (start_offset <= end_offset) {
-        static constexpr model::offset max_batch_size{
-          std::numeric_limits<int32_t>::max()};
-        // limit max batch size
-        const model::offset delta = std::min<model::offset>(
-          max_batch_size, end_offset - start_offset);
-
-        batches.push_back(
-          make_ghost_batch(start_offset, delta + start_offset, term));
-        start_offset = next_offset(batches.back().last_offset());
-    }
-
-    return batches;
-}
-
 } // anonymous namespace
 
 template<>
@@ -97,6 +76,28 @@ struct fmt::formatter<storage::log_reader> : fmt::formatter<std::string_view> {
 
 namespace storage {
 using records_t = ss::circular_buffer<model::record_batch>;
+
+/**
+ * makes multiple ghost batches required to fill the gap in a way that max batch
+ * size (max of int32_t) is not exceeded
+ */
+std::vector<model::record_batch> log_reader::make_ghost_batches(
+  model::offset start_offset, model::offset end_offset, model::term_id term) {
+    std::vector<model::record_batch> batches;
+    while (start_offset <= end_offset) {
+        static constexpr model::offset max_batch_size{
+          std::numeric_limits<int32_t>::max() - 1};
+        // limit max batch size
+        const model::offset delta = std::min<model::offset>(
+          max_batch_size, end_offset - start_offset);
+
+        batches.push_back(
+          make_ghost_batch(start_offset, delta + start_offset, term));
+        start_offset = next_offset(batches.back().last_offset());
+    }
+
+    return batches;
+}
 
 batch_consumer::consume_result skipping_consumer::accept_batch_start(
   const model::record_batch_header& header) const {
@@ -581,8 +582,8 @@ bool log_reader::is_done() {
            || is_finished_offset(_lease->range, _config.start_offset);
 }
 
-timequery_result batch_timequery(
-  const model::record_batch& b,
+ss::future<timequery_result> batch_timequery(
+  model::record_batch b,
   model::offset min_offset,
   model::timestamp t,
   model::offset max_offset) {
@@ -595,23 +596,25 @@ timequery_result batch_timequery(
     // records in the batch have different timestamps.
     model::offset result_o = b.base_offset();
     model::timestamp result_t = b.header().first_timestamp;
-    if (!b.compressed()) {
-        b.for_each_record(
-          [&result_o, &result_t, &b, query_interval, t](
-            const model::record& r) -> ss::stop_iteration {
-              auto record_o = model::offset{r.offset_delta()} + b.base_offset();
-              auto record_t = model::timestamp(
-                b.header().first_timestamp() + r.timestamp_delta());
-              if (record_t >= t && query_interval.contains(record_o)) {
-                  result_o = record_o;
-                  result_t = record_t;
-                  return ss::stop_iteration::yes;
-              } else {
-                  return ss::stop_iteration::no;
-              }
-          });
-    }
-    return {result_o, result_t};
+    auto batch = co_await internal::decompress_batch(std::move(b));
+    co_await batch.for_each_record_async(
+      [&result_o, &result_t, &batch, query_interval, t](
+        const model::record& r) -> ss::future<ss::stop_iteration> {
+          auto record_o = model::offset{r.offset_delta()} + batch.base_offset();
+          auto record_t = model::timestamp(
+            batch.header().first_timestamp() + r.timestamp_delta());
+          if (record_t >= t && query_interval.contains(record_o)) {
+              result_o = record_o;
+              result_t = record_t;
+              return ss::make_ready_future<ss::stop_iteration>(
+                ss::stop_iteration::yes);
+          } else {
+              return ss::make_ready_future<ss::stop_iteration>(
+                ss::stop_iteration::no);
+          }
+      });
+
+    co_return timequery_result{result_o, result_t};
 }
 
 } // namespace storage

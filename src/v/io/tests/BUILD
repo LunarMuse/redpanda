@@ -108,3 +108,37 @@ redpanda_cc_gtest(
         "@seastar",
     ],
 )
+
+redpanda_cc_gtest(
+    name = "page_cache_reclaim_test",
+    timeout = "short",
+    srcs = ["page_cache_reclaim_test.cc"],
+    memory = "500M",
+    deps = [
+        ":testing",
+        "//src/v/base",
+        "//src/v/container:fragmented_vector",
+        "//src/v/io",
+        "//src/v/ssx:async_algorithm",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:random",
+        "//src/v/utils:memory_data_source",
+        "@boost//:range",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "page_cache_test",
+    timeout = "short",
+    srcs = ["page_cache_test.cc"],
+    deps = [
+        ":testing",
+        "//src/v/base",
+        "//src/v/io",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)

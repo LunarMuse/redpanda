@@ -8,12 +8,21 @@
 // by the Apache License, Version 2.0
 
 #include "base/vlog.h"
+#include "cluster/feature_manager.h"
+#include "cluster/feature_update_action.h"
+#include "container/fragmented_vector.h"
+#include "features/feature_state.h"
+#include "features/feature_table.h"
 #include "gtest/gtest.h"
 #include "kafka/server/tests/produce_consume_utils.h"
 #include "model/namespace.h"
+#include "model/record_batch_reader.h"
 #include "model/record_batch_types.h"
+#include "model/timeout_clock.h"
 #include "random/generators.h"
 #include "redpanda/tests/fixture.h"
+#include "storage/segment.h"
+#include "storage/segment_utils.h"
 #include "storage/tests/manual_mixin.h"
 #include "storage/types.h"
 #include "test_utils/async.h"
@@ -28,6 +37,7 @@
 
 #include <chrono>
 #include <numeric>
+#include <ranges>
 
 using namespace std::chrono_literals;
 
@@ -224,7 +234,7 @@ public:
 
     ss::future<bool> do_sliding_window_compact(
       model::offset max_collect_offset,
-      std::optional<std::chrono::milliseconds> tombstone_ret_ms,
+      std::optional<std::chrono::milliseconds> tombstone_ret_ms = std::nullopt,
       std::optional<size_t> max_keys = std::nullopt) {
         // Compact, allowing the map to grow as large as we need.
         ss::abort_source never_abort;
@@ -241,6 +251,25 @@ public:
         // sliding_window_compact takes cfg by const&, so return will be a
         // use-after-free
         co_return co_await disk_log.sliding_window_compact(cfg);
+    }
+
+    ss::future<storage::compaction_result> do_segment_self_compact(
+      ss::lw_shared_ptr<storage::segment> seg,
+      model::offset max_collect_offset,
+      std::optional<std::chrono::milliseconds> tombstone_ret_ms = std::nullopt,
+      std::optional<size_t> max_keys = std::nullopt) {
+        ss::abort_source never_abort;
+        storage::compaction_config cfg(
+          max_collect_offset,
+          tombstone_ret_ms,
+          ss::default_priority_class(),
+          never_abort,
+          std::nullopt,
+          max_keys,
+          nullptr,
+          nullptr);
+        auto& disk_log = dynamic_cast<storage::disk_log_impl&>(*log);
+        co_return co_await disk_log.segment_self_compact(cfg, seg);
     }
 
 protected:
@@ -320,6 +349,10 @@ TEST_P(CompactionFixtureParamTest, TestDedupeOnePass) {
                                       model::offset(0))
                                     .get();
     ASSERT_EQ(consumed_kvs, consumed_kvs_restarted);
+
+    for (const auto& seg : log->segments()) {
+        ASSERT_EQ(seg->offsets().get_base_offset(), seg->index().base_offset());
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -361,6 +394,10 @@ TEST_F(CompactionFixtureTest, TestDedupeMultiPass) {
     ASSERT_EQ(segments_compacted_2, segments_compacted_3);
 
     ASSERT_NO_FATAL_FAILURE(check_records(cardinality, num_segments - 1).get());
+
+    for (const auto& seg : disk_log.segments()) {
+        ASSERT_EQ(seg->offsets().get_base_offset(), seg->index().base_offset());
+    }
 }
 
 TEST_F(CompactionFixtureTest, TestChunkedCompaction) {
@@ -450,6 +487,10 @@ TEST_F(CompactionFixtureTest, TestChunkedCompaction) {
     num_chunked_compaction_runs
       = disk_log.get_probe().get_chunked_compaction_runs();
     ASSERT_EQ(num_chunked_compaction_runs, 1);
+
+    for (const auto& seg : disk_log.segments()) {
+        ASSERT_EQ(seg->offsets().get_base_offset(), seg->index().base_offset());
+    }
 }
 
 TEST_F(CompactionFixtureTest, TestDedupeMultiPassAddedSegment) {
@@ -536,6 +577,10 @@ TEST_F(CompactionFixtureTest, TestDedupeMultiPassAddedSegment) {
       disk_log.get_last_compaction_window_start_offset().has_value());
 
     ASSERT_NO_FATAL_FAILURE(check_records(cardinality, num_segments - 1).get());
+
+    for (const auto& seg : disk_log.segments()) {
+        ASSERT_EQ(seg->offsets().get_base_offset(), seg->index().base_offset());
+    }
 }
 
 class CompactionFixtureBatchSizeParamTest
@@ -587,21 +632,16 @@ TEST_P(CompactionFixtureBatchSizeParamTest, TestRecompactWithNewData) {
     disk_log.sliding_window_compact(new_cfg).get();
 
     // Most segments have already compacted their segments away entirely,
-    // except their last record. Such segments shouldn't be compacted. Three
+    // except their last record. Such segments shouldn't be compacted. Two
     // segments should be compacted:
-    // - the new segment is compacted twice (self + windowed)
+    // - the new segment is self compacted
     // - the segment that previously had the latest keys should be compacted
     auto segments_compacted_3 = disk_log.get_probe().get_segments_compacted();
     auto compaction_ratio_3 = disk_log.compaction_ratio().get();
-    ASSERT_EQ(segments_compacted + 3, segments_compacted_3);
+    ASSERT_EQ(segments_compacted + 2, segments_compacted_3);
 
     // Check for a reasonable compaction ratio.
     ASSERT_LT(compaction_ratio_3, 0.65);
-
-    // Compared to our first compaction ratio that windowed compacted many
-    // segments in a row, one self-compaction + windowed compaction will have a
-    // worse compaction ratio.
-    ASSERT_LT(compaction_ratio, compaction_ratio_3);
 }
 INSTANTIATE_TEST_SUITE_P(
   RecordsPerBatch,
@@ -1336,3 +1376,250 @@ INSTANTIATE_TEST_SUITE_P(
   RandomDistributionMultiPass,
   CompactionFixtureTombstonesMultiPassRandomParamTest,
   ::testing::Combine(::testing::Bool(), ::testing::Values(10, 25, 100)));
+
+class CompactionFixturePlaceHolderBatchTest
+  : public CompactionFixtureTest
+  , public ::testing::WithParamInterface<bool> {};
+
+TEST_P(
+  CompactionFixturePlaceHolderBatchTest,
+  TestSelfCompactionWithPlaceholderBatch) {
+    bool placeholder_batch_enabled = GetParam();
+    if (!placeholder_batch_enabled) {
+        cluster::feature_manager& feature_manager
+          = app.controller->get_feature_manager().local();
+        feature_manager
+          .write_action(cluster::feature_update_action{
+            .feature_name = ss::sstring{"compaction_placeholder_batch"},
+            .action = cluster::feature_update_action::action_t::deactivate})
+          .get();
+        auto& feature_table = app.controller->get_feature_table().local();
+        auto feature_state
+          = feature_table
+              .get_state(features::feature::compaction_placeholder_batch)
+              .get_state();
+        ASSERT_TRUE(
+          feature_state == features::feature_state::state::disabled_active);
+    }
+
+    constexpr auto num_segments = 1;
+    constexpr auto cardinality = 1;
+    size_t batches_per_segment = 1;
+    size_t records_per_batch = 1;
+    map_t latest_kv_map;
+    generate_data(
+      num_segments,
+      cardinality,
+      batches_per_segment,
+      records_per_batch,
+      0,
+      true,
+      &latest_kv_map)
+      .get();
+
+    ASSERT_EQ(latest_kv_map.size(), 1);
+
+    auto& disk_log = dynamic_cast<storage::disk_log_impl&>(*log);
+    auto& segs = disk_log.segments();
+
+    ASSERT_EQ(segs.size(), 2);
+
+    auto check_num_data_batches =
+      [](const auto& batches, int expected_num_data_batches) {
+          int num_data_batches = 0;
+          for (const auto& b : batches) {
+              if (b.header().type == model::record_batch_type::raft_data) {
+                  ++num_data_batches;
+              }
+          }
+          ASSERT_EQ(num_data_batches, expected_num_data_batches);
+      };
+
+    // Mark the segment as having completed window compaction and cleanly
+    // compacted.
+    storage::internal::mark_segment_as_finished_window_compaction(
+      segs[0], true, disk_log.get_probe())
+      .get();
+
+    // Sleep to allow self compaction to _possibly_ remove the tombstone record.
+    ss::sleep(100ms).get();
+
+    // Self compact the segment
+    do_segment_self_compact(segs[0], model::offset::max(), 1ms).get();
+
+    {
+        auto seg_0_reader_cfg = storage::log_reader_config(
+          segs[0]->offsets().get_base_offset(),
+          model::offset::max(),
+          ss::default_priority_class());
+        auto seg_0_batches = model::consume_reader_to_memory(
+                               log->make_reader(seg_0_reader_cfg).get(),
+                               model::no_timeout)
+                               .get();
+
+        // We should expect that even though the tombstone is removable, because
+        // it is the last record in the segment, it is persisted due to
+        // feature::compaction_placeholder_batch being disabled.
+        auto num_expected_data_batches = placeholder_batch_enabled ? 0 : 1;
+        check_num_data_batches(seg_0_batches, num_expected_data_batches);
+    }
+
+    ASSERT_EQ(
+      segs[0]->offsets().get_base_offset(), segs[0]->index().base_offset());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  PlaceholderBatchEnabled,
+  CompactionFixturePlaceHolderBatchTest,
+  ::testing::Bool());
+
+TEST_F(CompactionFixtureTest, TestSegmentIndexReconstructed) {
+    constexpr auto num_segments = 5;
+    constexpr auto cardinality
+      = 1000000; // Large enough to ensure no duplicates- segment index relative
+                 // offsets _should_ be the same before and after compaction.
+    size_t batches_per_segment = 100;
+    size_t records_per_batch = 10;
+    generate_data(
+      num_segments, cardinality, batches_per_segment, records_per_batch)
+      .get();
+
+    auto& disk_log = dynamic_cast<storage::disk_log_impl&>(*log);
+    auto& segs = disk_log.segments();
+
+    for (const auto& seg : segs) {
+        if (!seg->has_appender()) {
+            auto pre_compact_relative_offset_index
+              = seg->index()
+                  .get_index_state()
+                  .index.copy_relative_offset_index();
+            // Self compact the segment
+            do_segment_self_compact(seg, model::offset::max()).get();
+            auto post_compact_relative_offset_index
+              = seg->index()
+                  .get_index_state()
+                  .index.copy_relative_offset_index();
+
+            ASSERT_EQ(
+              pre_compact_relative_offset_index,
+              post_compact_relative_offset_index);
+            ASSERT_EQ(
+              seg->offsets().get_base_offset(), seg->index().base_offset());
+        }
+    }
+
+    std::vector<chunked_vector<uint32_t>>
+      pre_sliding_window_index_relative_offsets;
+    for (const auto& seg : segs) {
+        if (!seg->has_appender()) {
+            pre_sliding_window_index_relative_offsets.push_back(
+              seg->index()
+                .get_index_state()
+                .index.copy_relative_offset_index());
+        }
+    }
+
+    bool did_compact = do_sliding_window_compact(model::offset::max()).get();
+    ASSERT_TRUE(did_compact);
+
+    std::vector<chunked_vector<uint32_t>>
+      post_sliding_window_index_relative_offsets;
+    for (const auto& seg : segs) {
+        if (!seg->has_appender()) {
+            post_sliding_window_index_relative_offsets.push_back(
+              seg->index()
+                .get_index_state()
+                .index.copy_relative_offset_index());
+            ASSERT_EQ(
+              seg->offsets().get_base_offset(), seg->index().base_offset());
+        }
+    }
+
+    ASSERT_EQ(
+      pre_sliding_window_index_relative_offsets,
+      post_sliding_window_index_relative_offsets);
+}
+
+TEST_F(CompactionFixtureTest, TestSlidingWindowNoUnecessaryRewrites) {
+    constexpr auto cardinality = 100;
+    constexpr auto num_segments = 2;
+    constexpr auto batches_per_segment = 1;
+    constexpr auto records_per_batch = 10;
+    generate_data(
+      num_segments, cardinality, batches_per_segment, records_per_batch)
+      .get();
+
+    ss::abort_source never_abort;
+    auto& disk_log = dynamic_cast<storage::disk_log_impl&>(*log);
+    auto& segments = disk_log.segments();
+
+    storage::compaction_config cfg(
+      model::offset::max(),
+      std::nullopt,
+      ss::default_priority_class(),
+      never_abort);
+
+    for (auto& seg : segments) {
+        if (!seg->has_appender()) {
+            disk_log.segment_self_compact(cfg, seg).get();
+        }
+    }
+
+    // Check that the segment .log file and the .compaction_index file are not
+    // re-written if they don't need to be during a round of sliding window
+    // compaction. The same check cannot be applied to the .base_index file, as
+    // segments may be marked cleanly compacted and the file would be reflushed
+    // to disk to reflect the updated state.
+    using time_point = std::chrono::system_clock::time_point;
+    std::vector<std::vector<time_point>>
+      segments_file_mtimes_pre_sliding_window;
+    for (auto& seg : segments) {
+        if (seg->has_appender()) {
+            continue;
+        }
+        std::vector<time_point> segment_file_mtimes{
+          ss::file_stat(seg->path().string()).get().time_modified,
+          ss::file_stat(seg->path().to_compacted_index().string())
+            .get()
+            .time_modified,
+        };
+        segments_file_mtimes_pre_sliding_window.push_back(segment_file_mtimes);
+    }
+
+    disk_log.sliding_window_compact(cfg).get();
+
+    std::vector<std::vector<time_point>>
+      segments_file_mtimes_post_sliding_window;
+    for (auto& seg : segments) {
+        if (seg->has_appender()) {
+            continue;
+        }
+        std::vector<time_point> segment_file_mtimes{
+          ss::file_stat(seg->path().string()).get().time_modified,
+          ss::file_stat(seg->path().to_compacted_index().string())
+            .get()
+            .time_modified,
+        };
+        segments_file_mtimes_post_sliding_window.push_back(segment_file_mtimes);
+    }
+
+    ASSERT_EQ(
+      segments_file_mtimes_pre_sliding_window,
+      segments_file_mtimes_post_sliding_window);
+
+    // We should see 2 compacted segments (from self-compaction)
+    auto segments_compacted = log->get_probe().get_segments_compacted();
+    ASSERT_EQ(segments_compacted, 2);
+
+    // Generate more data (of the same profile), and expect to see the original
+    // 2 segments now window compacted, and the additional 2 segments
+    // self-compacted.
+    generate_data(
+      num_segments, cardinality, batches_per_segment, records_per_batch)
+      .get();
+
+    disk_log.sliding_window_compact(cfg).get();
+
+    segments_compacted = log->get_probe().get_segments_compacted();
+    ASSERT_EQ(segments_compacted, 6);
+}

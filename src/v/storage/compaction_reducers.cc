@@ -150,7 +150,7 @@ ss::future<std::optional<model::record_batch>>
 copy_data_segment_reducer::filter(model::record_batch batch) {
     // do not compact raft configuration and archival metadata as they shift
     // offset translation
-    if (!is_compactible(batch)) {
+    if (!is_compactible(_ntp, batch)) {
         co_return std::move(batch);
     }
 
@@ -161,12 +161,14 @@ copy_data_segment_reducer::filter(model::record_batch batch) {
     int32_t records_seen = 0;
     co_await batch.for_each_record_async(
       [this, &batch, &offset_deltas, &records_seen](const model::record& r) {
-          records_seen++;
+          ++records_seen;
           return maybe_keep_offset(
             batch, r, batch.record_count() == records_seen, offset_deltas);
       });
 
-    if (batch.last_offset() == _segment_last_offset && offset_deltas.empty()) {
+    if (
+      _compaction_placeholder_enabled
+      && batch.last_offset() == _segment_last_offset && offset_deltas.empty()) {
         // last batch in the segment has been compacted away.
         // This is most likely caused by aborted data batches getting compacted
         // away during self compaction of the segment if they are the last batch
@@ -174,7 +176,7 @@ copy_data_segment_reducer::filter(model::record_batch batch) {
         // contiguousness of the offset space.
         auto placeholder = make_placeholder_batch(batch.header());
         vlog(
-          stlog.debug,
+          gclog.debug,
           "installing a placeholder {} for compacted batch: {}",
           placeholder,
           batch);
@@ -291,7 +293,7 @@ ss::future<ss::stop_iteration> copy_data_segment_reducer::filter_and_append(
     const auto records_to_remove = record_count_before
                                    - to_copy->record_count();
     _stats.records_discarded += records_to_remove;
-    bool compactible_batch = is_compactible(to_copy.value());
+    bool compactible_batch = is_compactible(_ntp, to_copy.value());
     if (!compactible_batch) {
         ++_stats.non_compactible_batches;
     }
@@ -316,7 +318,7 @@ ss::future<ss::stop_iteration> copy_data_segment_reducer::filter_and_append(
     // caller who has more context
     if (_idx.maybe_index(
           _acc,
-          32_KiB,
+          segment_index::default_data_buffer_step,
           start_pos,
           batch.base_offset(),
           batch.last_offset(),
@@ -427,7 +429,7 @@ bool tx_reducer::can_discard_consumer_offsets_batch(
     // committed data has already been rewritten as separate raft_data batches,
     // so no need to retain originally written group_prepare_tx batches while
     // the transaction is in progress.
-    return is_compactible_control_batch(b.header().type);
+    return is_compactible_control_batch(_ntp, b.header().type);
 }
 
 ss::future<ss::stop_iteration> tx_reducer::operator()(model::record_batch&& b) {
@@ -438,7 +440,7 @@ ss::future<ss::stop_iteration> tx_reducer::operator()(model::record_batch&& b) {
           can_discard_tx_data_batch(b)
           || can_discard_consumer_offsets_batch(b)) {
             vlog(
-              stlog.trace, "discarded batch during compaction: {}", b.header());
+              gclog.trace, "discarded batch during compaction: {}", b.header());
             _stats.batches_discarded++;
             co_return ss::stop_iteration::no;
         }
@@ -475,7 +477,7 @@ map_building_reducer::operator()(model::record_batch batch) {
     // There is no point to indexing records in uncompactible batches, since
     // their inclusion in the segment post compaction is irrespective of the map
     // state (see copy_data_segment_reducer::filter()).
-    if (!is_compactible(batch)) {
+    if (!is_compactible(_ntp, batch)) {
         co_return ss::stop_iteration::no;
     }
     auto b = co_await decompress_batch(std::move(batch));
