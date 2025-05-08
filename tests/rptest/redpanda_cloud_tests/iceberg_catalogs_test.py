@@ -16,7 +16,6 @@ import requests
 from ducktape.mark import matrix
 from rptest.tests.redpanda_cloud_test import RedpandaCloudTest
 from rptest.services.provider_clients.rpcloud_client import RpCloudApiClient
-#from rptest.clients.databricks_client import DatabricksClient
 
 from rptest.clients.installpack import InstallPackClient
 from rptest.clients.rpk import RpkTool, TopicSpec, RpkException
@@ -88,33 +87,30 @@ class IcebergCloudCatalogsTest(RedpandaCloudTest):
         self.logger.debug(f"Enable iceberg response: {enable_resp}")
 
         # Parameters for creating redpanda secret
-        secret_id = "TEST5"
+        secret_id = "UNITY_CLIENT_SECRET5"
         secret_data = globals["databricks_client_secret"]
-        dataplane_url = "https://api-bcc8909f.d095sv34bhjo2t0rfqh0.byoc.ign.cloud.redpanda.com"  # TODO: Get URL from spec
-
-        # Call create_secret with default scopes
-        create_resp = cloud_cluster.create_secret(secret_id, secret_data,
-                                                  dataplane_url)
+        create_resp = cloud_cluster.create_secret(secret_id, secret_data)
         self.logger.debug(f"Create secret response: {create_resp}")
 
-        self.logger.debug(f"===============\n\n\n")
+        iceberg_rest_catalog_endpoint = globals[
+            "databricks_workspace_url"] + "/api/2.1/unity-catalog/iceberg-rest"
+        databricks_client_id = globals["databricks_client_id"]
+        iceberg_rest_catalog_warehouse = globals[
+            "databricks_sql_warehouse_path"]
 
         # Construct the payload for the request
         payload = {
             "cluster_configuration": {
                 "custom_properties": {
                     "iceberg_rest_catalog_endpoint":
-                    globals["databricks_workspace_url"],
-                    "iceberg_rest_catalog_authentication_mode":
-                    "oauth2",
-                    "iceberg_rest_catalog_client_id":
-                    globals["databricks_client_id"],
+                    iceberg_rest_catalog_endpoint,
+                    "iceberg_rest_catalog_authentication_mode": "oauth2",
+                    "iceberg_rest_catalog_client_id": databricks_client_id,
                     "iceberg_rest_catalog_client_secret":
-                    f"${{secrets.{secret_id}}}",
+                    "${secrets.UNITY_CLIENT_SECRET5}",
                     "iceberg_rest_catalog_warehouse":
-                    globals["databricks_sql_warehouse_path"],
-                    "iceberg_catalog_type":
-                    "rest"
+                    iceberg_rest_catalog_warehouse,
+                    "iceberg_catalog_type": "rest"
                 }
             }
         }
@@ -132,7 +128,7 @@ class IcebergCloudCatalogsTest(RedpandaCloudTest):
         self.logger.debug(
             f"Response for passing catalog params via public API: {response}")
 
-        # TODO Marat insert topics and verification
+        # TODO Marat insert topics and verification (separate PR)
 
         # databricks cleanup
         databricks_client.stop()

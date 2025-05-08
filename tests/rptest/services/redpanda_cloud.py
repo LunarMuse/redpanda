@@ -581,6 +581,9 @@ class CloudCluster():
         self.current.zones = _c['spec']['zones']
         self.current.network_id = _c['spec']['networkId']
         self.current.network_cidr = _c['spec']['network']['networkCidr']
+        self.current.dataplane_public_api_url = _c.get(
+            'redpandaConsole', {}).get('dataplane-api-public',
+                                       {}).get('urls', [None])[0]
         if self.current.region != self.config.region:
             raise RuntimeError("BYOC Cluster is in different region: "
                                f"'{self.current.region}'. Multi-region "
@@ -1587,19 +1590,15 @@ class CloudCluster():
             })
         return update_resp
 
-    def create_secret(self,
-                      secret_id,
-                      secret_data,
-                      dataplane_url,
-                      scopes=None):
+    def create_secret(self, secret_id, secret_data, scopes=None):
         """
         Create a new secret on dataplane and return the response.
         :param secret_id: ID of the secret to create
         :param secret_data: Data for the secret
-        :param dataplane_url: Dataplane API URL to create the secret
         :param scopes: List of scopes for the secret (default is ["SCOPE_REDPANDA_CLUSTER"])
         :return: response from the API request
         """
+        dataplane_url = self._get_dataplane_api_url()
         if scopes is None:
             scopes = ["SCOPE_REDPANDA_CLUSTER"]
         response = self.public_api._http_post(base_url=dataplane_url,
@@ -1610,3 +1609,7 @@ class CloudCluster():
                                                   "secret_data": secret_data,
                                               })
         return response
+
+    def _get_dataplane_api_url(self):
+        cluster = self.rpcloud.get_cluster(self.current.cluster_id)
+        return cluster['dataplane_api']['url']
