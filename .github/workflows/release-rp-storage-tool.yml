@@ -14,5 +14,5 @@ jobs:
           sudo wget -O /usr/local/bin/bazel https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
           sudo chmod +x /usr/local/bin/bazel
           sudo ./bazel/install-deps.sh
-          bazel build --config=release //...
+          bazel --spawn_strategy=standalone --genrule_strategy=standalone build --config=release //...
     
