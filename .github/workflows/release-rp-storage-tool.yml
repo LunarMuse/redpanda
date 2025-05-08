@@ -10,6 +10,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build binary
         run: |
-          sudo apt install -y bazel
-          ./bazel/install-deps.sh
+          sudo apt-get update && sudo apt install -y wget python3 python3-venv curl pigz patchelf devscripts debhelper
+          sudo wget -O /usr/local/bin/bazel https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazel
+          sudo ./bazel/install-deps.sh
           bazel build --config=release //...
+    
