@@ -377,11 +377,14 @@ func (g *headerGenerator) generateFile(w *codewriter) {
 		g.generateEnumSerde(enum, w)
 		w.Println()
 	}
-	// Now emit all messages.
-	for _, msg := range msgs {
+	// Now emit all messages, but do it in a best effort order to avoid
+	// circular dependencies. If you are still seeing circular dependencies,
+	// this sort is stable, so you can reorder messages to get the order you want.
+	for _, msg := range sortMessages(msgs) {
 		g.generateMessage(msg, w)
 		w.Println()
 	}
+	// Last emit services
 	for i := range g.file.Services().Len() {
 		service := g.file.Services().Get(i)
 		g.generateService(service, w)
@@ -470,7 +473,7 @@ func (g *headerGenerator) generateEnum(enum protoreflect.EnumDescriptor, w *code
 	defer w.Dedent()
 	for i := range enum.Values().Len() {
 		val := enum.Values().Get(i)
-		w.Printf("%s = %d,\n", strings.ToLower(string(val.Name())), val.Number())
+		w.Printf("%s = %d,\n", enumMemberName(val), val.Number())
 	}
 }
 
@@ -776,7 +779,11 @@ func (g *implGenerator) generateEnumToString(enum protoreflect.EnumDescriptor, w
 	defer w.Println("}")
 	for i := range enum.Values().Len() {
 		v := enum.Values().Get(i)
-		w.Printf("case %s::%s:\n", cppTypeName(enum), strings.ToLower(string(v.Name())))
+		// Skip aliases
+		if enum.Values().ByNumber(v.Number()) != v {
+			continue
+		}
+		w.Printf("case %s::%s:\n", cppTypeName(enum), enumMemberName(v))
 		w.Indent()
 		w.Printf("return %q;\n", v.Name())
 		w.Dedent()
@@ -804,7 +811,11 @@ func (g *implGenerator) generateEnumFromJson(enum protoreflect.EnumDescriptor, w
 		pairs := make([]string, 0, enum.Values().Len())
 		for i := range enum.Values().Len() {
 			value := enum.Values().Get(i)
-			pair := fmt.Sprintf("{%q, %s::%s},", value.Name(), cppTypeName(enum), strings.ToLower(string(value.Name())))
+			// Skip aliases
+			if enum.Values().ByNumber(value.Number()) != value {
+				continue
+			}
+			pair := fmt.Sprintf("{%q, %s::%s},", value.Name(), cppTypeName(enum), enumMemberName(value))
 			pairs = append(pairs, pair)
 		}
 		// Sort the pairs for binary search.
@@ -818,7 +829,7 @@ func (g *implGenerator) generateEnumFromJson(enum protoreflect.EnumDescriptor, w
 		w.Println("if (eq.empty()) {")
 		w.Indent()
 		defaultValue := enum.Values().ByNumber(0)
-		w.Printf("*e = %s::%s;\n", cppTypeName(enum), strings.ToLower(string(defaultValue.Name())))
+		w.Printf("*e = %s::%s;\n", cppTypeName(enum), enumMemberName(defaultValue))
 		w.Dedent()
 		w.Println("} else {")
 		w.Indent()
@@ -836,16 +847,20 @@ func (g *implGenerator) generateEnumFromJson(enum protoreflect.EnumDescriptor, w
 		defer w.Println("}")
 		for i := range enum.Values().Len() {
 			value := enum.Values().Get(i)
+			// Skip aliases
+			if enum.Values().ByNumber(value.Number()) != value {
+				continue
+			}
 			w.Printf("case %d:\n", value.Number())
 			w.Indent()
-			w.Printf("*e = %s::%s;\n", cppTypeName(enum), strings.ToLower(string(value.Name())))
+			w.Printf("*e = %s::%s;\n", cppTypeName(enum), enumMemberName(value))
 			w.Println("return;")
 			w.Dedent()
 		}
 		value := enum.Values().ByNumber(0)
 		w.Println("default:")
 		w.Indent()
-		w.Printf("*e = %s::%s;\n", cppTypeName(enum), strings.ToLower(string(value.Name())))
+		w.Printf("*e = %s::%s;\n", cppTypeName(enum), enumMemberName(value))
 		w.Println("return;")
 		w.Dedent()
 	}()
@@ -1838,6 +1853,26 @@ func collectDescriptors(parent protoreflect.Descriptor) (msgs []protoreflect.Mes
 	return
 }
 
+func sortMessages(msgs []protoreflect.MessageDescriptor) []protoreflect.MessageDescriptor {
+	return sortCyclicalGraph(msgs, func(m protoreflect.MessageDescriptor) []protoreflect.MessageDescriptor {
+		var children []protoreflect.MessageDescriptor
+		for i := range m.Fields().Len() {
+			f := m.Fields().Get(i)
+			if f.IsMap() {
+				if child := f.MapKey().Message(); child != nil {
+					children = append(children, child)
+				}
+				if child := f.MapValue().Message(); child != nil {
+					children = append(children, child)
+				}
+			} else if child := f.Message(); child != nil {
+				children = append(children, child)
+			}
+		}
+		return children
+	})
+}
+
 // ----------------------------------------------------------
 
 func cppTypeName(d protoreflect.Descriptor) string {
@@ -1869,4 +1904,10 @@ func getOneofFieldVariantIndex(oneof protoreflect.OneofDescriptor, field protore
 		}
 	}
 	return -1
+}
+
+func enumMemberName(val protoreflect.EnumValueDescriptor) string {
+	fullName := strings.ToLower(string(val.Name()))
+	strippedName := strings.TrimPrefix(fullName, cppTypeName(val.Parent())+"_")
+	return strippedName
 }
