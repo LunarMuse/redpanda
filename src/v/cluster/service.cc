@@ -913,6 +913,14 @@ service::update_cluster_link_configuration(
     co_return update_cluster_link_configuration_response{.ec = result};
 }
 
+ss::future<delete_mirror_topic_response> service::delete_mirror_topic(
+  delete_mirror_topic_request req, rpc::streaming_context&) {
+    auto deadline = model::timeout_clock::now() + req.timeout;
+    auto result = co_await _cluster_link_frontend.local().delete_mirror_topic(
+      req.link_id, std::move(req.cmd), deadline);
+    co_return delete_mirror_topic_response{.ec = result};
+}
+
 ss::future<get_current_cluster_epoch_response>
 service::get_current_cluster_epoch(
   get_current_cluster_epoch_request, ::rpc::streaming_context&) {

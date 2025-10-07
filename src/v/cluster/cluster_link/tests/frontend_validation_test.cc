@@ -20,6 +20,7 @@ namespace cluster::cluster_link {
 
 using ::cluster_link::model::add_mirror_topic_cmd;
 using ::cluster_link::model::connection_config;
+using ::cluster_link::model::delete_mirror_topic_cmd;
 using ::cluster_link::model::id_t;
 using ::cluster_link::model::link_configuration;
 using ::cluster_link::model::metadata;
@@ -99,6 +100,18 @@ public:
             auto err = co_await _table.local().apply_update(
               testing::create_add_mirror_topic_command(id, std::move(cmd)));
             vassert(!err, "Failed to add mirror topic: {}", err.message());
+        }
+        co_return ec;
+    }
+
+    ss::future<cluster::cluster_link::errc>
+    delete_mirror_topic(id_t id, delete_mirror_topic_cmd cmd) {
+        cluster::cluster_link_delete_mirror_topic_cmd del_cmd{id, cmd};
+        auto ec = _validator->validate_mutation(std::move(del_cmd));
+        if (ec == errc::success) {
+            auto err = co_await _table.local().apply_update(
+              testing::create_delete_mirror_topic_command(id, std::move(cmd)));
+            vassert(!err, "Failed to delete mirror topic: {}", err.message());
         }
         co_return ec;
     }
@@ -591,6 +604,86 @@ TEST_F_CORO(frontend_validation_test, update_mirror_topic_mirrored_by_other) {
 
     EXPECT_EQ(
       co_await update_mirror_topic_status(id_t{2}, std::move(update_cmd)),
+      errc::topic_being_mirrored_by_other_link);
+}
+
+TEST_F_CORO(frontend_validation_test, delete_mirror_topic_success) {
+    ASSERT_EQ_CORO(
+      co_await upsert_cluster_link(create_base_metadata()), errc::success);
+    auto id = _table.local().find_id_by_name(name_t("link1"));
+    ASSERT_TRUE_CORO(id.has_value());
+
+    {
+        add_mirror_topic_cmd cmd{
+          .topic = model::topic("mirror-topic"),
+          .metadata = testing::create_mirror_topic_metadata(
+            mirror_topic_status::active, model::topic("mirror-topic"))};
+        EXPECT_EQ(
+          co_await add_mirror_topic(id.value(), std::move(cmd)), errc::success);
+    }
+
+    {
+        delete_mirror_topic_cmd cmd{.topic = model::topic("mirror-topic")};
+        EXPECT_EQ(
+          co_await delete_mirror_topic(id.value(), std::move(cmd)),
+          errc::success);
+    }
+}
+
+TEST_F_CORO(frontend_validation_test, delete_mirror_topic_invalid_name) {
+    ASSERT_EQ_CORO(
+      co_await upsert_cluster_link(create_base_metadata()), errc::success);
+    auto id = _table.local().find_id_by_name(name_t("link1"));
+    ASSERT_TRUE_CORO(id.has_value());
+
+    delete_mirror_topic_cmd cmd{.topic = model::topic("\xFF\xFF\xFF")};
+    EXPECT_EQ(
+      co_await delete_mirror_topic(id.value(), std::move(cmd)),
+      errc::mirror_topic_name_invalid);
+}
+
+TEST_F_CORO(frontend_validation_test, delete_mirror_topic_no_link) {
+    delete_mirror_topic_cmd cmd{.topic = model::topic("mirror-topic")};
+    EXPECT_EQ(
+      co_await delete_mirror_topic(id_t{5}, std::move(cmd)),
+      errc::does_not_exist);
+}
+
+TEST_F_CORO(frontend_validation_test, delete_mirror_topic_not_found) {
+    ASSERT_EQ_CORO(
+      co_await upsert_cluster_link(create_base_metadata()), errc::success);
+    auto id = _table.local().find_id_by_name(name_t("link1"));
+    ASSERT_TRUE_CORO(id.has_value());
+
+    delete_mirror_topic_cmd cmd{.topic = model::topic("mirror-topic")};
+    EXPECT_EQ(
+      co_await delete_mirror_topic(id.value(), std::move(cmd)),
+      errc::topic_not_being_mirrored);
+}
+
+TEST_F_CORO(
+  frontend_validation_test, delete_mirror_topic_mirrored_by_other_link) {
+    model::topic test_topic("mirror-link1");
+    mirror_topic_status mirror_state = mirror_topic_status::active;
+    auto m1 = create_base_metadata();
+    testing::set_link_mirror_topics(m1, test_topic, mirror_state, test_topic);
+
+    auto m2 = create_base_metadata(name_t("link2"));
+
+    ASSERT_EQ_CORO(
+      co_await _table.local().apply_update(
+        testing::create_upsert_command(model::offset{1}, std::move(m1))),
+      errc::success);
+
+    ASSERT_EQ_CORO(
+      co_await _table.local().apply_update(
+        testing::create_upsert_command(model::offset{2}, std::move(m2))),
+      errc::success);
+
+    delete_mirror_topic_cmd cmd{.topic = test_topic};
+
+    EXPECT_EQ(
+      co_await delete_mirror_topic(id_t{2}, std::move(cmd)),
       errc::topic_being_mirrored_by_other_link);
 }
 

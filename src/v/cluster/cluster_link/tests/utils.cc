@@ -16,6 +16,7 @@
 namespace cluster::cluster_link::testing {
 
 using ::cluster_link::model::add_mirror_topic_cmd;
+using ::cluster_link::model::delete_mirror_topic_cmd;
 using ::cluster_link::model::id_t;
 using ::cluster_link::model::metadata;
 using ::cluster_link::model::mirror_topic_metadata;
@@ -40,6 +41,12 @@ model::record_batch
 create_add_mirror_topic_command(id_t id, add_mirror_topic_cmd cmd) {
     cluster::cluster_link_add_mirror_topic_cmd add_cmd(id, std::move(cmd));
     return cluster::serde_serialize_cmd(std::move(add_cmd));
+}
+
+model::record_batch
+create_delete_mirror_topic_command(id_t id, delete_mirror_topic_cmd cmd) {
+    cluster::cluster_link_delete_mirror_topic_cmd del_cmd(id, std::move(cmd));
+    return cluster::serde_serialize_cmd(std::move(del_cmd));
 }
 
 model::record_batch create_update_mirror_topic_status_command(

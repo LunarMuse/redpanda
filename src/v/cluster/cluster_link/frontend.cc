@@ -16,14 +16,17 @@
 #include "cluster/logger.h"
 #include "cluster/partition_leaders_table.h"
 #include "cluster/types.h"
+#include "cluster_link/model/filter_utils.h"
 #include "cluster_link/model/types.h"
 #include "config/configuration.h"
 #include "model/validation.h"
 #include "rpc/connection_cache.h"
+#include "ssx/when_all.h"
 
 namespace cluster::cluster_link {
 
 using ::cluster_link::model::add_mirror_topic_cmd;
+using ::cluster_link::model::delete_mirror_topic_cmd;
 using ::cluster_link::model::id_t;
 using ::cluster_link::model::metadata;
 using ::cluster_link::model::name_t;
@@ -119,6 +122,18 @@ ss::future<errc> frontend::add_mirror_topic(
     co_return co_await do_mutation(std::move(c), timeout);
 }
 
+ss::future<errc> frontend::delete_mirror_topic(
+  id_t id,
+  delete_mirror_topic_cmd cmd,
+  model::timeout_clock::time_point timeout) {
+    if (!cluster_linking_enabled()) {
+        co_return errc::feature_disabled;
+    }
+    cluster_link_cmd c{
+      cluster::cluster_link_delete_mirror_topic_cmd(id, std::move(cmd))};
+    co_return co_await do_mutation(std::move(c), timeout);
+}
+
 ss::future<errc> frontend::update_mirror_topic_status(
   id_t id,
   update_mirror_topic_status_cmd cmd,
@@ -178,6 +193,11 @@ std::optional<id_t> frontend::find_link_id_by_name(const name_t& name) const {
     return _table->find_id_by_name(name);
 }
 
+std::optional<id_t>
+frontend::find_link_id_by_topic(model::topic_view topic) const {
+    return _table->find_id_by_topic(topic);
+}
+
 std::optional<std::reference_wrapper<const metadata>>
 frontend::find_link_by_id(id_t id) const {
     return _table->find_link_by_id(id);
@@ -233,6 +253,56 @@ frontend::get_mirror_topics_for_link(id_t id) const {
 std::optional<::model::revision_id> frontend::get_last_update_revision(
   const ::cluster_link::model::id_t& id) const {
     return _table->get_link_last_update_revision(id);
+}
+
+bool frontend::is_autocreate_mirror_topic(const model::topic& topic) const {
+    auto link_id = _table->find_id_by_topic(topic);
+    if (!link_id.has_value()) {
+        return false;
+    }
+    auto link = _table->find_link_by_id(link_id.value());
+    vassert(
+      link.has_value(), "Expected value for link with id {}", link_id.value());
+    const auto& topic_filters
+      = link->get()
+          .configuration.topic_metadata_mirroring_cfg.topic_name_filters;
+    return ::cluster_link::model::select_topic(topic, topic_filters);
+}
+
+ss::future<topic_result> frontend::delete_mirror_topic(
+  model::topic topic, model::timeout_clock::time_point timeout) {
+    const auto& link_id = _table->find_id_by_topic(topic);
+    if (!link_id.has_value()) {
+        co_return topic_result{
+          std::move(topic), errc::topic_not_being_mirrored};
+    }
+
+    topic_result ret;
+    ret.topic = topic;
+    ret.ec = co_await delete_mirror_topic(
+      link_id.value(),
+      delete_mirror_topic_cmd{.topic = std::move(topic)},
+      timeout);
+
+    co_return ret;
+}
+
+ss::future<chunked_vector<topic_result>> frontend::delete_mirror_topics(
+  chunked_vector<model::topic> topics,
+  model::timeout_clock::time_point timeout) {
+    vlog(clusterlog.debug, "Deleting mirror topics {}", topics);
+
+    const auto do_delete =
+      [this, timeout](model::topic t) -> ss::future<topic_result> {
+        return delete_mirror_topic(std::move(t), timeout);
+    };
+
+    auto fut_r = topics | std::views::as_rvalue
+                 | std::views::transform(do_delete);
+    chunked_vector<ss::future<topic_result>> futures{
+      fut_r.begin(), fut_r.end()};
+    return ssx::when_all_succeed<chunked_vector<topic_result>>(
+      std::move(futures));
 }
 
 ss::future<errc> frontend::do_mutation(
@@ -359,6 +429,24 @@ ss::future<errc> frontend::dispatch_mutation_to_remote(
                           }
                           return result<void>(r.value().ec);
                       });
+              },
+              [client, timeout](
+                cluster::cluster_link_delete_mirror_topic_cmd cmd) mutable {
+                  return client
+                    .delete_mirror_topic(
+                      cluster::delete_mirror_topic_request{
+                        .link_id = cmd.key,
+                        .cmd = std::move(cmd.value),
+                        .timeout = timeout},
+                      rpc::client_opts(timeout))
+                    .then(
+                      &rpc::get_ctx_data<cluster::delete_mirror_topic_response>)
+                    .then([](result<cluster::delete_mirror_topic_response> r) {
+                        if (r.has_error()) {
+                            return result<void>(r.error());
+                        }
+                        return result<void>(r.value().ec);
+                    });
               },
               [client, timeout](
                 cluster::cluster_link_update_cluster_link_configuration_cmd
@@ -628,6 +716,38 @@ errc frontend::validator::validate_mutation(const cluster_link_cmd& cmd) const {
                 "Invalid replication factor: {}",
                 cmd.value.metadata.replication_factor);
               return errc::invalid_update;
+          }
+          return errc::success;
+      },
+      [this](const cluster::cluster_link_delete_mirror_topic_cmd& cmd) {
+          auto ec = model::validate_kafka_topic_name(cmd.value.topic);
+          if (ec) {
+              vlog(cluster::clusterlog.warn, "Invalid topic name: {}", ec);
+              return errc::mirror_topic_name_invalid;
+          }
+          auto meta = _table->find_link_by_id(cmd.key);
+          if (!meta.has_value()) {
+              return errc::does_not_exist;
+          }
+          auto id = _table->find_id_by_topic(cmd.value.topic);
+          if (!id.has_value()) {
+              vlog(
+                cluster::clusterlog.warn,
+                "Attempting to delete mirror topic '{}' from link '{}', "
+                "however topic is not being mirrored",
+                cmd.value.topic,
+                meta->get().name);
+              return errc::topic_not_being_mirrored;
+          }
+          if (id.value() != cmd.key) {
+              vlog(
+                cluster::clusterlog.warn,
+                "Attempting to delete mirror topic '{}' from link '{}', "
+                "however topic "
+                "is mirrored by another link",
+                cmd.value.topic,
+                meta->get().name);
+              return errc::topic_being_mirrored_by_other_link;
           }
           return errc::success;
       },
