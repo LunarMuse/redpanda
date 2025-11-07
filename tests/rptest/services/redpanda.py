@@ -1271,8 +1271,8 @@ class RedpandaServiceABC(ABC, RedpandaServiceConstants):
     def wait_until(
         self,
         fn: Callable[[], Any],
-        timeout_sec: int,
-        backoff_sec: int,
+        timeout_sec: float,
+        backoff_sec: float,
         err_msg: str | Callable[[], str] = "",
         retry_on_exc: bool = False,
     ) -> None:
@@ -1312,9 +1312,9 @@ class RedpandaServiceABC(ABC, RedpandaServiceConstants):
         self,
         check: Callable[[], Any],
         condition: Callable[[], Any],
-        timeout_sec: int,
-        progress_sec: int,
-        backoff_sec: int,
+        timeout_sec: float,
+        progress_sec: float,
+        backoff_sec: float,
         err_msg: str | None = None,
         logger: Logger | None = None,
     ) -> None:
@@ -2176,9 +2176,7 @@ class RedpandaServiceCloud(KubeServiceMixin, RedpandaServiceABC):
         if uh_reason is not None:
             raise CorruptedClusterError(uh_reason)
 
-        uh_reason = self._cloud_cluster._ensure_cluster_health()
-        if uh_reason is not None:
-            raise CorruptedClusterError(uh_reason)
+        self._cloud_cluster._ensure_cluster_health()
 
         expected_nodes = int(self.config_profile["nodes_count"])
         active, _, _ = self.get_redpanda_pods_presorted()

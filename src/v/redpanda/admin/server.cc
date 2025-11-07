@@ -92,6 +92,7 @@
 #include "security/audit/schemas/types.h"
 #include "security/audit/types.h"
 #include "serde/protobuf/rpc.h"
+#include "ssx/future-util.h"
 #include "ssx/sformat.h"
 #include "strings/string_switch.h"
 #include "strings/utf8.h"
@@ -870,17 +871,21 @@ void admin_server::log_exception(
         return os.str();
     };
 
-    try {
-        std::rethrow_exception(eptr);
-    } catch (const ss::httpd::base_exception& ex) {
-        const auto status = static_cast<http_status_ut>(ex.status());
-        if (ex.status() == http_status::internal_server_error) {
-            vlog(adminlog.error, "{}", log_ex(status));
-        } else if (status >= 400) {
-            vlog(adminlog.warn, "{}", log_ex(status));
+    if (ssx::is_shutdown_exception(eptr)) {
+        vlog(adminlog.debug, "{}", log_ex());
+    } else {
+        try {
+            std::rethrow_exception(eptr);
+        } catch (const ss::httpd::base_exception& ex) {
+            const auto status = static_cast<http_status_ut>(ex.status());
+            if (ex.status() == http_status::internal_server_error) {
+                vlog(adminlog.error, "{}", log_ex(status));
+            } else if (status >= 400) {
+                vlog(adminlog.warn, "{}", log_ex(status));
+            }
+        } catch (...) {
+            vlog(adminlog.error, "{}", log_ex());
         }
-    } catch (...) {
-        vlog(adminlog.error, "{}", log_ex());
     }
 }
 
